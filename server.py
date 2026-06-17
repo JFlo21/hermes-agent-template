@@ -49,6 +49,7 @@ from starlette.responses import (
     JSONResponse,
     RedirectResponse,
     Response,
+    StreamingResponse,
 )
 from starlette.routing import Route, WebSocketRoute
 from starlette.templating import Jinja2Templates
@@ -66,6 +67,23 @@ PAIRING_TTL = 3600
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+
+# ── MCP-over-HTTP bridge target ───────────────────────────────────────────────
+# supergateway (launched in start.sh) wraps `hermes mcp serve` as a
+# Streamable-HTTP MCP endpoint on this loopback port. We reverse-proxy the
+# public /mcp path to it, gated by a Bearer token (MCP_BEARER_TOKEN) that is
+# entirely separate from the dashboard's cookie auth. This lets other agents /
+# MCP clients reach this deployment's conversation tools without ever touching
+# the admin UI's credentials. When MCP_BEARER_TOKEN is unset the route refuses
+# every request (503-equivalent 401), and start.sh skips launching the bridge.
+MCP_BRIDGE_HOST = "127.0.0.1"
+MCP_BRIDGE_PORT = int(os.environ.get("MCP_BRIDGE_PORT", "9300"))
+MCP_BRIDGE_URL = f"http://{MCP_BRIDGE_HOST}:{MCP_BRIDGE_PORT}"
+MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+# Headers we must NOT copy upstream/downstream verbatim (httpx/Starlette manage
+# them). Everything else — notably mcp-session-id and mcp-protocol-version — is
+# forwarded so the stateful MCP session handshake survives the proxy hop.
+_MCP_HOP_BY_HOP = {"host", "content-length", "transfer-encoding", "connection"}
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
@@ -1002,6 +1020,81 @@ def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+# ── MCP reverse proxy (Bearer-auth, streaming) ───────────────────────────────
+import secrets as _mcp_secrets  # constant-time token compare
+
+
+def _mcp_authorized(request: "Request") -> bool:
+    """True iff a valid Bearer token is present. Fail-closed when unconfigured."""
+    if not MCP_BEARER_TOKEN:
+        return False
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    return _mcp_secrets.compare_digest(auth[7:].strip(), MCP_BEARER_TOKEN)
+
+
+async def route_mcp(request: "Request") -> Response:
+    """Reverse-proxy /mcp -> the supergateway bridge with streaming.
+
+    Distinct from the dashboard proxy: (1) auth is Bearer-token, NOT the admin
+    cookie; (2) the response is streamed, because MCP Streamable-HTTP replies
+    with text/event-stream that must not be buffered; (3) mcp-session-id and
+    other MCP headers are forwarded verbatim so stateful sessions work.
+    """
+    if not _mcp_authorized(request):
+        return JSONResponse(
+            {"error": "Unauthorized", "detail": "valid MCP_BEARER_TOKEN required"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    client = get_http_client()
+    target = f"{MCP_BRIDGE_URL}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _MCP_HOP_BY_HOP
+    }
+    body = await request.body()
+
+    req = client.build_request(
+        request.method, target, headers=fwd_headers, content=body,
+    )
+    try:
+        upstream = await client.send(req, stream=True)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return JSONResponse(
+            {"error": "MCP bridge unavailable",
+             "detail": f"no listener on {MCP_BRIDGE_URL} (is MCP_BEARER_TOKEN set so start.sh launched supergateway?)"},
+            status_code=503,
+        )
+    except httpx.RequestError as e:
+        print(f"[mcp-proxy] upstream error {request.method} {request.url.path}: {e}", flush=True)
+        return JSONResponse({"error": "MCP bridge error", "detail": str(e)}, status_code=502)
+
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in _MCP_HOP_BY_HOP and k.lower() != "content-encoding"
+    }
+
+    async def _body_iter():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        _body_iter(),
+        status_code=upstream.status_code,
+        headers=resp_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
 # ── Route handlers ────────────────────────────────────────────────────────────
 async def page_index(request: Request):
     if err := guard(request): return err
@@ -1556,6 +1649,12 @@ routes = [
     # (e.g. kanban's /api/plugins/kanban/events). Prefix-matched so new plugin
     # WS endpoints in future hermes releases proxy without re-touching this list.
     WebSocketRoute("/api/plugins/{path:path}",  ws_proxy),
+
+    # MCP-over-HTTP bridge — Bearer-auth, streamed. Must precede the dashboard
+    # catch-all so /mcp is not swallowed by the cookie-guarded proxy. Both /mcp
+    # and any /mcp/* subpaths route here.
+    Route("/mcp",                               route_mcp,           methods=ANY_METHOD),
+    Route("/mcp/{path:path}",                   route_mcp,           methods=ANY_METHOD),
 
     # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
     Route("/",                                  route_root,          methods=ANY_METHOD),

@@ -65,6 +65,14 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache -r /app/requirements.txt
 
+# MCP-over-HTTP bridge. `hermes mcp serve` speaks stdio only; supergateway wraps
+# it in a Streamable-HTTP endpoint so other MCP clients/agents can reach this
+# deployment's conversation tools (conversations_list, messages_read,
+# messages_send, events_wait, ...) at /mcp. Installed globally at build time —
+# Node.js stays in the runtime image (only /opt/hermes-agent/web is stripped),
+# so nothing is downloaded at container boot. Pinned to a major version.
+RUN npm install -g supergateway@3 && npm cache clean --force
+
 RUN mkdir -p /data/.hermes
 
 COPY server.py /app/server.py

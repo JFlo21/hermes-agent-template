@@ -48,4 +48,32 @@ fi
 # container), so removing the file unconditionally is safe.
 rm -f /data/.hermes/gateway.pid
 
+# --- MCP-over-HTTP bridge (additive; does NOT touch the gateway) -------------
+# Expose `hermes mcp serve` (stdio) as a Streamable-HTTP MCP endpoint on an
+# internal loopback port. server.py reverse-proxies /mcp -> this port with
+# Bearer-token auth (MCP_BEARER_TOKEN). Reads the SAME /data/.hermes volume as
+# the gateway, so the MCP tools see this agent's real Discord/Telegram
+# conversations. Started in the background; the gateway+dashboard (server.py)
+# remain PID 1's foreground child exactly as before.
+#
+# Only start the bridge when a token is configured — no token means the /mcp
+# proxy route in server.py refuses all requests anyway, so launching the
+# backend would just waste a port.
+MCP_BRIDGE_PORT="${MCP_BRIDGE_PORT:-9300}"
+if [ -n "${MCP_BEARER_TOKEN}" ]; then
+  echo "[start] launching MCP bridge (supergateway) on 127.0.0.1:${MCP_BRIDGE_PORT}" >&2
+  supergateway \
+      --stdio "hermes mcp serve" \
+      --outputTransport streamableHttp \
+      --stateful \
+      --host 127.0.0.1 \
+      --port "${MCP_BRIDGE_PORT}" \
+      --streamableHttpPath /mcp \
+      --healthEndpoint /healthz \
+      --logLevel info &
+else
+  echo "[start] MCP_BEARER_TOKEN unset — MCP bridge not started" >&2
+fi
+# ---------------------------------------------------------------------------
+
 exec python /app/server.py
