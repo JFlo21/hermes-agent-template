@@ -62,10 +62,13 @@ rm -f /data/.hermes/gateway.pid
 MCP_BRIDGE_PORT="${MCP_BRIDGE_PORT:-9300}"
 if [ -n "${MCP_BEARER_TOKEN}" ]; then
   echo "[start] launching MCP bridge (supergateway) on 127.0.0.1:${MCP_BRIDGE_PORT}" >&2
+  # Stateless mode (no --stateful): supergateway auto-initializes each request
+  # and tracks no per-request connection state. This is robust behind our
+  # reverse proxy; --stateful crashed with "No connection established for
+  # request ID" when the proxied SSE stream closed between turns.
   supergateway \
       --stdio "hermes mcp serve" \
       --outputTransport streamableHttp \
-      --stateful \
       --host 127.0.0.1 \
       --port "${MCP_BRIDGE_PORT}" \
       --streamableHttpPath /mcp \
