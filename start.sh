@@ -62,16 +62,20 @@ rm -f /data/.hermes/gateway.pid
 MCP_BRIDGE_PORT="${MCP_BRIDGE_PORT:-9300}"
 if [ -n "${MCP_BEARER_TOKEN}" ]; then
   echo "[start] launching MCP bridge (supergateway) on 127.0.0.1:${MCP_BRIDGE_PORT}" >&2
-  # Stateless mode (no --stateful): supergateway auto-initializes each request
-  # and tracks no per-request connection state. This is robust behind our
-  # reverse proxy; --stateful crashed with "No connection established for
-  # request ID" when the proxied SSE stream closed between turns.
+  # SSE transport: supergateway's streamableHttp output crashes with
+  # "No connection established for request ID" under the official MCP client's
+  # handshake (a known supergateway/SDK bug). The older SSE transport is
+  # battle-tested and works cleanly behind our reverse proxy. SSE uses two
+  # paths under /mcp: the event stream (/mcp/sse) and the POST channel
+  # (/mcp/message); both are covered by the /mcp/{path} proxy route in
+  # server.py.
   supergateway \
       --stdio "hermes mcp serve" \
-      --outputTransport streamableHttp \
+      --outputTransport sse \
       --host 127.0.0.1 \
       --port "${MCP_BRIDGE_PORT}" \
-      --streamableHttpPath /mcp \
+      --ssePath /mcp/sse \
+      --messagePath /mcp/message \
       --healthEndpoint /healthz \
       --logLevel info &
 else

@@ -1060,8 +1060,12 @@ async def route_mcp(request: "Request") -> Response:
     }
     body = await request.body()
 
+    # SSE event streams are long-lived GET connections — the shared client's
+    # 30s timeout would sever them mid-stream. Bound only the connect phase;
+    # leave read/write/pool unbounded so /mcp/sse can stay open indefinitely.
     req = client.build_request(
         request.method, target, headers=fwd_headers, content=body,
+        timeout=httpx.Timeout(None, connect=5.0),
     )
     try:
         upstream = await client.send(req, stream=True)
