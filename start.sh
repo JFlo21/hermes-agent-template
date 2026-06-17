@@ -61,28 +61,20 @@ rm -f /data/.hermes/gateway.pid
 # backend would just waste a port.
 MCP_BRIDGE_PORT="${MCP_BRIDGE_PORT:-9300}"
 if [ -n "${MCP_BEARER_TOKEN}" ]; then
-  echo "[start] launching supervised MCP bridge on 127.0.0.1:${MCP_BRIDGE_PORT}" >&2
-  # Supervisor loop: supergateway runs ONE `hermes mcp serve` stdio child, which
-  # holds a single MCP transport. The MCP SDK errors "Already connected to a
-  # transport" if a second client connects while one is active, and the child
-  # then wedges and never recovers. Relaunching supergateway on every exit gives
-  # each fresh client a clean child. The loop runs in the background so the
+  echo "[start] launching MCP bridge (mcp-proxy) on 127.0.0.1:${MCP_BRIDGE_PORT}" >&2
+  # mcp-proxy exposes `hermes mcp serve` (stdio) as a streamable-HTTP
+  # endpoint at 127.0.0.1:${MCP_BRIDGE_PORT}/mcp. server.py reverse-proxies
+  # /mcp -> here with Bearer-token auth. mcp-proxy
+  # spawns a fresh stdio child per client session, so repeated/overlapping
+  # connections work without wedging. Runs in the background; the
   # gateway+dashboard (server.py) stay the foreground process.
-  (
-    while true; do
-      supergateway \
-          --stdio "hermes mcp serve" \
-          --outputTransport sse \
-          --host 127.0.0.1 \
-          --port "${MCP_BRIDGE_PORT}" \
-          --ssePath /mcp/sse \
-          --messagePath /mcp/message \
-          --healthEndpoint /healthz \
-          --logLevel info
-      echo "[start] MCP bridge exited (rc=$?), restarting in 2s" >&2
-      sleep 2
-    done
-  ) &
+  # --stateless: single-endpoint streamable HTTP at /mcp (no separate SSE +
+  # /messages/ paths), which proxies cleanly through server.py's /mcp route.
+  mcp-proxy \
+      --host 127.0.0.1 \
+      --port "${MCP_BRIDGE_PORT}" \
+      --stateless \
+      -- hermes mcp serve &
 else
   echo "[start] MCP_BEARER_TOKEN unset — MCP bridge not started" >&2
 fi
